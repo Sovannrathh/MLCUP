@@ -1,0 +1,106 @@
+# Build artifacts and caches
+.version
+*.pyc
+*.tsbuildinfo
+.pytest_cache/
+__pycache__/
+coverage/
+dist/
+docs/_build/
+node_modules/
+
+# OS metadata
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# IDE metadata
+.idea/
+
+# Project-specific
+.nemoclaw-maintainer/
+draft_newsletter_*
+research/
+specs/
+vdr-notes/
+
+# Security: secrets, credentials, and keys
+*_ecdsa
+*_ed25519
+*_rsa
+*.jks
+*.key
+*.keystore
+*.p12
+*.pem
+*.pfx
+*.tfvars
+.direnv/
+.env
+.env.*
+.envrc
+.netrc
+.npmrc
+.pypirc
+credentials.json
+DRAFT-*.md
+key.json
+secrets.json
+secrets.yaml
+service-account*.json
+token.json
+.e2e/
+
+# Ignore generated or temporary files managed by the Workbench
+.project/*
+!.project/spec.yaml
+!.project/configpacks
+
+# General ignores
+
+# Byte-compiled / optimized / DLL files
+*.py[cod]
+*$py.class
+
+# Temp directories, notebooks created by jupyterlab
+.ipynb_checkpoints
+.Trash-*/
+.jupyter/
+.local/
+
+# Python distribution / packaging
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+cover/
+
+*.txt
+
+# Workbench Project Layout
