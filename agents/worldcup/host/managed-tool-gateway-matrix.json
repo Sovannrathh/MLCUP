@@ -1,0 +1,19 @@
+{
+  "worldcup-web": {
+    "service": "worldcup-search",
+    "description": "WorldCup managed web search gateway",
+    "config": {
+      "web": {
+        "backend": "worldcup",
+        "use_gateway": true
+      }
+    },
+    "envKey": "WORLDCUP_SEARCH_GATEWAY_URL",
+    "envValue": "http://host.openshell.internal:11437/worldcup-search",
+    "brokerPath": "/worldcup-search",
+    "upstream": "https://api.worldcup.ai/v1/search",
+    "sandboxAuthHeaders": ["Authorization: Bearer", "x-api-key"],
+    "upstreamAuthHeader": "Authorization: Bearer",
+    "tools": ["web_search", "web_extract"]
+  }
+}

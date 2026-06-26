@@ -19,6 +19,11 @@ fail() {
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
+# Normalise Git Bash / MSYS2 OS strings to Linux so the Linux asset is used on Windows
+case "$OS" in
+  MINGW* | MSYS* | CYGWIN*) OS="Linux" ;;
+esac
+
 case "$OS" in
   Darwin) OS_LABEL="macOS" ;;
   Linux) OS_LABEL="Linux" ;;
@@ -140,23 +145,31 @@ openshell_has_required_messaging_features() {
     OPENSHELL_FEATURE_CHECK_ERROR="openshell binary was not found."
     return 1
   fi
-  if ! command -v strings >/dev/null 2>&1; then
-    OPENSHELL_FEATURE_CHECK_ERROR="'strings' is required to verify OpenShell messaging credential rewrite support. Install binutils or an equivalent package and retry."
-    return 2
-  fi
-
   # Keep this independent of a live gateway. `policy update --dry-run` still
   # needs gateway metadata, but the CLI binary must contain the endpoint-option
   # parser for request-body/WebSocket rewrite support released in OpenShell 0.0.39.
-  local binary_strings
-  binary_strings="$(strings "$openshell_bin" 2>/dev/null || true)"
-  if [[ "$binary_strings" != *"request-body-credential-rewrite"* ]]; then
-    OPENSHELL_FEATURE_CHECK_ERROR="OpenShell binary is missing request-body-credential-rewrite support."
-    return 1
-  fi
-  if [[ "$binary_strings" != *"websocket-credential-rewrite"* ]]; then
-    OPENSHELL_FEATURE_CHECK_ERROR="OpenShell binary is missing websocket-credential-rewrite support."
-    return 1
+  # Use strings if available; fall back to grep --binary-files=text (always present,
+  # including Git Bash on Windows where binutils/strings is typically absent).
+  if command -v strings >/dev/null 2>&1; then
+    local binary_strings
+    binary_strings="$(strings "$openshell_bin" 2>/dev/null || true)"
+    if [[ "$binary_strings" != *"request-body-credential-rewrite"* ]]; then
+      OPENSHELL_FEATURE_CHECK_ERROR="OpenShell binary is missing request-body-credential-rewrite support."
+      return 1
+    fi
+    if [[ "$binary_strings" != *"websocket-credential-rewrite"* ]]; then
+      OPENSHELL_FEATURE_CHECK_ERROR="OpenShell binary is missing websocket-credential-rewrite support."
+      return 1
+    fi
+  else
+    if ! grep -qF --binary-files=text "request-body-credential-rewrite" "$openshell_bin" 2>/dev/null; then
+      OPENSHELL_FEATURE_CHECK_ERROR="OpenShell binary is missing request-body-credential-rewrite support."
+      return 1
+    fi
+    if ! grep -qF --binary-files=text "websocket-credential-rewrite" "$openshell_bin" 2>/dev/null; then
+      OPENSHELL_FEATURE_CHECK_ERROR="OpenShell binary is missing websocket-credential-rewrite support."
+      return 1
+    fi
   fi
   return 0
 }

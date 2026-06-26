@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Agent manifest for WorldCup Agent.
+# Declares the integration contract between NemoClaw and the sandboxed agent.
+
+name: worldcup
+display_name: "WorldCup Agent"
+description: "Self-predict worldcup 2026"
+version_constraint: ">=0.8.0"
+language: python
+license: MIT
+
+# ── Binary & process ────────────────────────────────────────────
+install_method: curl  # curl install.sh | bash
+binary_path: /usr/local/bin/worldcup
+version_command: "worldcup --version"
+expected_version: "2026.5.1"
+gateway_command: "worldcup gateway run"
+
+# ── Health probe ────────────────────────────────────────────────
+# The API server adapter listens on 8643 by default and exposes
+# GET /health -> {"status": "ok", "platform": "worldcup-agent"}
+health_probe:
+  url: "http://localhost:8643/health"
+  port: 8643
+  timeout_seconds: 90
+
+# ── Dashboard / UI ──────────────────────────────────────────────
+dashboard:
+  kind: ui
+  label: "Dashboard"
+  path: "/"
+  health_path: "/api/status"
+  auth: session
+forward_ports:
+  - 18790
+  - 8643
+
+# ── Configuration ───────────────────────────────────────────────
+config:
+  dir: /sandbox/.worldcup
+  config_file: config.yaml
+  env_file: .env                  # relative to dir — API keys
+  auth_file: auth.json
+  format: yaml
+
+# ── State directories ──────────────────────────────────────────
+state_dirs:
+  - memories
+  - sessions
+  - skills
+  - plugins
+  - cron
+  - logs
+  - skins
+  - plans
+  - workspace
+  - profiles
+  - cache
+  - pairing
+
+# ── Top-level durable state files ───────────────────────────────
+# The SQLite database is captured with SQLite's online backup API; WAL/SHM
+# files are intentionally omitted because the backup produces a consistent DB.
+# .worldcup_history is user runtime history: prompt_toolkit appends to it on
+# every TUI keypress, so NemoClaw intentionally keeps it sandbox-writable even
+# when shields-up locks the parent config dir.
+state_files:
+  - path: SOUL.md
+  - path: .worldcup_history
+  - path: runtime/state.db
+    strategy: sqlite_backup
+
+# ── Authentication ──────────────────────────────────────────────
+device_pairing: false
+web_auth_method: bearer_token
+web_auth_env: API_SERVER_KEY
+
+# ── Messaging platforms ─────────────────────────────────────────
+messaging_platforms:
+  supported:
+    - matrix
+
+# ── Inference ───────────────────────────────────────────────────
+# WorldCup supports custom OpenAI-compatible endpoints natively via
+# provider: "custom" + base_url in config.yaml. This is how we
+# route through OpenShell's inference.local proxy.
+inference:
+  provider_type: custom
+  base_url_config_key: "model.base_url"
+  model_config_key: "model.default"
+  proxy_support: implicit  # via httpx (OpenAI SDK dep)
+  provider_options:
+    - worldcupProvider
+
+# ── Phone-home hosts ───────────────────────────────────────────
+phone_home_hosts:
+  - worldcup.ai
+  - api.worldcup.ai
+
+# ── Package registry ───────────────────────────────────────────
+package_registry:
+  hosts:
+    - pypi.org
+    - files.pythonhosted.org
+  binary: /usr/local/bin/pip3

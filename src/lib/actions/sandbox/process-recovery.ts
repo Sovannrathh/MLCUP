@@ -1,0 +1,874 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+import { Buffer } from "node:buffer";
+import { spawnSync } from "node:child_process";
+import { dockerSpawnSync } from "../../adapters/docker";
+import {
+  captureOpenshell,
+  captureOpenshellForStatus,
+  captureSandboxSshConfig,
+  getOpenshellBinary,
+  isCommandTimeout,
+  runOpenshell,
+} from "../../adapters/openshell/runtime";
+import { OPENSHELL_PROBE_TIMEOUT_MS } from "../../adapters/openshell/timeouts";
+import {
+  buildHermesEnvFileBoundaryStandaloneCheck,
+  SECRET_BOUNDARY_OK_MARKER,
+  SECRET_BOUNDARY_REFUSED_MARKER,
+  SECRET_BOUNDARY_VALIDATOR_MISSING_MARKER,
+} from "../../agent/hermes-recovery-boundary";
+import * as agentRuntime from "../../agent/runtime";
+import { G, R } from "../../cli/terminal-style";
+import { DASHBOARD_PORT } from "../../core/ports";
+import { sleepSeconds, waitUntil } from "../../core/wait";
+import { ROOT, shellQuote } from "../../runner";
+import { createTempSshConfig } from "../../sandbox/temp-ssh-config";
+import * as registry from "../../state/registry";
+import { parseForwardList } from "../../state/sandbox-session";
+import { classifyForwardHealthWithReachability, isLocalForwardReachable } from "./forward-health";
+import { printGatewayWedgeDiagnostics } from "./gateway-wedge-diagnostics";
+import {
+  ensureHermesDashboardPortForwardIfEnabled as ensureHermesDashboardPortForward,
+  getHermesDashboardRecoveryConfig,
+  recoverHermesDashboardProcessIfEnabled as recoverHermesDashboardProcess,
+} from "./hermes-dashboard-recovery";
+
+export {
+  classifyForwardHealthWithReachability,
+  classifySandboxForwardHealth,
+} from "./forward-health";
+
+export type SandboxCommandResult = {
+  status: number;
+  stdout: string;
+  stderr: string;
+};
+
+type SandboxPortAgent = { forwardPort?: unknown; runtime?: { kind?: unknown } } | null;
+
+type SandboxPortDeps = {
+  getSandbox?: typeof registry.getSandbox;
+  getSessionAgent?: (sandboxName?: string) => SandboxPortAgent;
+};
+
+export type SandboxForwardListEntry = {
+  sandboxName: string;
+  port: string;
+  status: string;
+};
+
+export type SandboxForwardHealth = boolean | "occupied" | null;
+
+const SANDBOX_EXEC_STARTED_MARKER = "__NEMOCLAW_SANDBOX_EXEC_STARTED__";
+
+function buildSandboxExecMarkedCommand(command: string): string {
+  if (!command.includes("validate-hermes-env-secret-boundary.py")) {
+    return `printf '%s\n' '${SANDBOX_EXEC_STARTED_MARKER}'; ${command}`;
+  }
+  const encodedCommand = Buffer.from(command, "utf8").toString("base64");
+  return [
+    `printf '%s\\n' '${SANDBOX_EXEC_STARTED_MARKER}'`,
+    "command -v base64 >/dev/null 2>&1 || { echo NEMOCLAW_BASE64_MISSING >&2; exit 127; }",
+    `printf '%s' '${encodedCommand}' | base64 -d | sh`,
+  ].join("; ");
+}
+
+function parseSandboxExecStdoutFrame(line: string): { text: string; framed: boolean } {
+  const trimmed = line.trimStart();
+  const stdoutPrefix = trimmed.match(/^(?:\[stdout\]|stdout:)\s*/i);
+  if (!stdoutPrefix) return { text: line, framed: false };
+  return { text: trimmed.slice(stdoutPrefix[0].length), framed: true };
+}
+
+/**
+ * Extract child-command stdout from `openshell sandbox exec` output after the
+ * sentinel printed by `markedCommand`. Some OpenShell versions frame child
+ * stdout for humans, e.g. `stdout: __NEMOCLAW_SANDBOX_EXEC_STARTED__`, while
+ * older versions pass raw stdout through unchanged. Normalize only recognized
+ * stdout frame prefixes at this transport boundary so recovery, status, and
+ * Hermes boundary callers keep consuming plain command stdout.
+ *
+ * Security boundary: the sentinel must occupy its own stdout line after optional
+ * frame-prefix stripping. A preamble that merely contains the sentinel string is
+ * rejected so sandbox output cannot move the parser boundary forward. Remove
+ * this compatibility shim once OpenShell exposes a stable machine-readable exec
+ * output mode that preserves child stdout/stderr without human framing.
+ */
+function extractSandboxExecCommandStdout(output: string): string | null {
+  const stdout = output.trim();
+  if (!stdout) return null;
+  const lines = stdout.split(/\r?\n/).map(parseSandboxExecStdoutFrame);
+  const exactMarkerIndex = lines.findIndex(
+    (line) => line.text.trim() === SANDBOX_EXEC_STARTED_MARKER,
+  );
+  if (exactMarkerIndex >= 0) {
+    return lines
+      .slice(exactMarkerIndex + 1)
+      .map((line) => line.text)
+      .join("\n")
+      .trim();
+  }
+
+  return null;
+}
+
+function isValidPort(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
+export function resolveSandboxDashboardPort(
+  sandboxName: string,
+  deps: SandboxPortDeps = {},
+): number {
+  const getSessionAgent = deps.getSessionAgent ?? agentRuntime.getSessionAgent;
+  const agent = getSessionAgent(sandboxName);
+  if (agent && agentRuntime.hasGatewayRuntime(agent) && isValidPort(agent.forwardPort)) {
+    return agent.forwardPort;
+  }
+
+  const getSandbox = deps.getSandbox ?? registry.getSandbox;
+  const sandbox = getSandbox(sandboxName);
+  return isValidPort(sandbox?.dashboardPort) ? sandbox.dashboardPort : DASHBOARD_PORT;
+}
+
+function getSandboxHealthProbeUrl(sandboxName: string): string {
+  const agent = agentRuntime.getSessionAgent(sandboxName);
+  if (agent && agentRuntime.hasGatewayRuntime(agent)) return agentRuntime.getHealthProbeUrl(agent);
+  return `http://127.0.0.1:${resolveSandboxDashboardPort(sandboxName)}/health`;
+}
+
+/**
+ * Run a command inside the sandbox via SSH and return { status, stdout, stderr }.
+ * Returns null if SSH config cannot be obtained.
+ */
+export function executeSandboxCommand(
+  sandboxName: string,
+  command: string,
+): SandboxCommandResult | null {
+  const sshConfigResult = captureSandboxSshConfig(sandboxName, {
+    ignoreError: true,
+    timeout: OPENSHELL_PROBE_TIMEOUT_MS,
+  });
+  if (sshConfigResult.status !== 0) return null;
+  if (!sshConfigResult.output.trim()) return null;
+
+  const tmpSshConfig = createTempSshConfig(sshConfigResult.output, "nemoclaw-ssh-");
+  try {
+    const result = spawnSync(
+      "ssh",
+      [
+        "-F",
+        tmpSshConfig.file,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "LogLevel=ERROR",
+        `openshell-${sandboxName}`,
+        command,
+      ],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 15000 },
+    );
+    return {
+      status: result.status ?? 1,
+      stdout: (result.stdout || "").trim(),
+      stderr: (result.stderr || "").trim(),
+    };
+  } catch {
+    return null;
+  } finally {
+    tmpSshConfig.cleanup();
+  }
+}
+
+function parseSandboxCommandResult(
+  result: ReturnType<typeof spawnSync>,
+): SandboxCommandResult | null {
+  if (result.error) return null;
+  const stdout = typeof result.stdout === "string" ? result.stdout : String(result.stdout || "");
+  const stderr = typeof result.stderr === "string" ? result.stderr : String(result.stderr || "");
+  const commandStdout = extractSandboxExecCommandStdout(stdout);
+  if (commandStdout === null) return null;
+  return {
+    status: result.status ?? 1,
+    stdout: commandStdout,
+    stderr: stderr.trim(),
+  };
+}
+
+function findLocalDockerSandboxContainer(sandboxName: string): string | null {
+  const expectedName = `openshell-${sandboxName}`;
+  try {
+    const result = dockerSpawnSync(["ps", "--format", "{{.ID}}\t{{.Names}}"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5000,
+    });
+    if (result.error || result.status !== 0) return null;
+    for (const line of String(result.stdout || "").split(/\r?\n/)) {
+      const [id = "", names = ""] = line.split("\t");
+      const containerNames = names.split(",").map((name) => name.trim());
+      if (id && containerNames.includes(expectedName)) return id;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function executeLocalDockerSandboxCommand(
+  sandboxName: string,
+  markedCommand: string,
+  timeout: number,
+): SandboxCommandResult | null {
+  const containerId = findLocalDockerSandboxContainer(sandboxName);
+  if (!containerId) return null;
+  try {
+    const result = dockerSpawnSync(["exec", "-u", "root", containerId, "sh", "-c", markedCommand], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout,
+    });
+    return parseSandboxCommandResult(result);
+  } catch {
+    return null;
+  }
+}
+
+export function executeSandboxExecCommand(
+  sandboxName: string,
+  command: string,
+  timeout = 15000,
+): SandboxCommandResult | null {
+  const markedCommand = buildSandboxExecMarkedCommand(command);
+  const timeoutOverride = Number(process.env.NEMOCLAW_SANDBOX_EXEC_TIMEOUT_MS || "");
+  const effectiveTimeout =
+    Number.isFinite(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : timeout;
+  try {
+    const result = spawnSync(
+      getOpenshellBinary(),
+      ["sandbox", "exec", "--name", sandboxName, "--", "sh", "-c", markedCommand],
+      {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: effectiveTimeout,
+      },
+    );
+    return (
+      parseSandboxCommandResult(result) ??
+      executeLocalDockerSandboxCommand(sandboxName, markedCommand, effectiveTimeout)
+    );
+  } catch {
+    return executeLocalDockerSandboxCommand(sandboxName, markedCommand, effectiveTimeout);
+  }
+}
+
+async function executeSandboxExecCommandForStatus(
+  sandboxName: string,
+  command: string,
+): Promise<SandboxCommandResult | null> {
+  const markedCommand = buildSandboxExecMarkedCommand(command);
+  const result = await captureOpenshellForStatus(
+    ["sandbox", "exec", "--name", sandboxName, "--", "sh", "-c", markedCommand],
+    { ignoreError: true },
+  );
+  if (isCommandTimeout(result) || result.error) return null;
+  const commandStdout = extractSandboxExecCommandStdout(result.output || "");
+  if (commandStdout === null) return null;
+  return {
+    status: result.status ?? 1,
+    stdout: commandStdout,
+    stderr: "",
+  };
+}
+
+function parseSandboxGatewayProbe(result: SandboxCommandResult | null): boolean | null {
+  if (!result) return null;
+  if (result.stdout === "RUNNING") return true;
+  if (result.stdout === "STOPPED") return false;
+  return null;
+}
+
+/**
+ * Check whether the OpenClaw gateway process is running inside the sandbox.
+ * Uses the gateway's HTTP /health endpoint as the source of truth,
+ * since the gateway runs as a separate user and pgrep may not see it.
+ * Returns true (running), false (stopped), or null (cannot determine).
+ *
+ * Uses HTTP status code extraction instead of `curl -sf` so that
+ * 401 (device auth enabled) is correctly treated as "alive".
+ * Fixes #2342 — previously `curl -sf` failed on 401, causing false
+ * "Health Offline" readings.
+ */
+function isSandboxGatewayRunning(sandboxName: string): boolean | null {
+  const agent = agentRuntime.getSessionAgent(sandboxName);
+  if (agent && !agentRuntime.hasGatewayRuntime(agent)) return null;
+  const probeUrl = getSandboxHealthProbeUrl(sandboxName);
+  const command = `HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' --max-time 3 ${shellQuote(probeUrl)} 2>/dev/null || echo 000); case "$HTTP_CODE" in 200|401) echo RUNNING ;; *) echo STOPPED ;; esac`;
+  const execProbe = parseSandboxGatewayProbe(executeSandboxExecCommand(sandboxName, command));
+  if (execProbe !== null) return execProbe;
+  return parseSandboxGatewayProbe(executeSandboxCommand(sandboxName, command));
+}
+
+export async function isSandboxGatewayRunningForStatus(
+  sandboxName: string,
+): Promise<boolean | null> {
+  const agent = agentRuntime.getSessionAgent(sandboxName);
+  if (agent && !agentRuntime.hasGatewayRuntime(agent)) return null;
+  const probeUrl = getSandboxHealthProbeUrl(sandboxName);
+  const command = `HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' --max-time 3 ${shellQuote(probeUrl)} 2>/dev/null || echo 000); case "$HTTP_CODE" in 200|401) echo RUNNING ;; *) echo STOPPED ;; esac`;
+  return parseSandboxGatewayProbe(await executeSandboxExecCommandForStatus(sandboxName, command));
+}
+
+/**
+ * Probe the full inference chain by curling `https://inference.local/v1/models`
+ * from inside the sandbox via `openshell sandbox exec`. This is the path agent
+ * traffic actually takes (openclaw gateway → auth proxy → backend). Any HTTP
+ * response (including 401) means routing works; 000 / no response means DNS,
+ * proxy, or gateway is broken. The optional 3rd line in #3265.
+ *
+ * Injectable via `execImpl` for tests.
+ */
+export async function probeSandboxInferenceGatewayHealth(
+  sandboxName: string,
+  options: {
+    execImpl?: (sandboxName: string, command: string) => Promise<SandboxCommandResult | null>;
+  } = {},
+): Promise<{
+  ok: boolean;
+  endpoint: string;
+  httpStatus: number;
+  detail: string;
+} | null> {
+  const endpoint = "https://inference.local/v1/models";
+  const command = `HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' --max-time 5 ${shellQuote(endpoint)} 2>/dev/null || echo 000); echo "$HTTP_CODE"`;
+  const exec = options.execImpl ?? executeSandboxExecCommandForStatus;
+  const result = await exec(sandboxName, command);
+  if (!result || result.status !== 0) return null;
+  const status = Number.parseInt(result.stdout.trim(), 10) || 0;
+  if (status > 0) {
+    return {
+      ok: true,
+      endpoint,
+      httpStatus: status,
+      detail: `Inference gateway responded HTTP ${status} on ${endpoint} (full chain reachable).`,
+    };
+  }
+  return {
+    ok: false,
+    endpoint,
+    httpStatus: 0,
+    detail:
+      `Inference gateway unreachable on ${endpoint} from inside the sandbox. ` +
+      `DNS may have failed or the openclaw gateway / auth proxy is not running.`,
+  };
+}
+
+/**
+ * Restart the gateway process inside the sandbox after a pod restart.
+ * Cleans stale lock/temp files, sources proxy config, and launches the gateway
+ * in the background. Returns true on success.
+ */
+function recoverSandboxProcesses(sandboxName: string): boolean {
+  const agent = agentRuntime.getSessionAgent(sandboxName);
+  const dashboardPort = resolveSandboxDashboardPort(sandboxName);
+  const agentScript = agentRuntime.buildRecoveryScript(agent, dashboardPort, {
+    hermesDashboard: getHermesDashboardRecoveryConfig(sandboxName),
+  });
+  const hasRecoveryMarker = (result: SandboxCommandResult | null) =>
+    !!(
+      result &&
+      (result.stdout.includes("GATEWAY_PID=") || result.stdout.includes("ALREADY_RUNNING"))
+    );
+  const recoveredSsh = (result: SandboxCommandResult | null) =>
+    !!(result && result.status === 0 && hasRecoveryMarker(result));
+
+  if (agentRuntime.isTerminalAgentRecoveryScript(agentScript)) return false;
+  if (agentScript) {
+    // Non-OpenClaw manifests do not yet declare a runtime user for root
+    // sandbox exec. Recover them over SSH so the launch inherits the sandbox
+    // login user instead of creating root-owned agent state under /sandbox.
+    return recoveredSsh(executeSandboxCommand(sandboxName, agentScript));
+  }
+
+  const script = agentRuntime.buildOpenClawRecoveryScript(dashboardPort);
+  const execResult = executeSandboxExecCommand(sandboxName, script, 30000);
+  if (hasRecoveryMarker(execResult)) return true;
+  if (execResult !== null) return false;
+  return recoveredSsh(executeSandboxCommand(sandboxName, script));
+}
+
+function recoverDeclaredAgentForwardPorts(
+  sandboxName: string,
+  recoveryPort: number,
+  { quiet }: { quiet: boolean },
+): boolean | null {
+  const recovered = ensureDeclaredAgentForwardPortsHealthy(sandboxName, recoveryPort);
+  if (!quiet && recovered === false) {
+    console.error("  One or more agent-declared port forwards could not be re-established.");
+  }
+  return recovered;
+}
+
+function readNonNegativeNumberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+export function waitForRecoveredSandboxGateway(
+  sandboxName: string,
+  options: {
+    probeImpl?: (sandboxName: string) => boolean | null;
+    sleepImpl?: (seconds: number) => void;
+    quiet?: boolean;
+  } = {},
+): boolean {
+  const probe = options.probeImpl ?? isSandboxGatewayRunning;
+  const sleep = options.sleepImpl ?? sleepSeconds;
+  const timeoutSeconds = readNonNegativeNumberEnv("NEMOCLAW_GATEWAY_RECOVERY_WAIT_SECONDS", 30);
+  const intervalSeconds = readNonNegativeNumberEnv(
+    "NEMOCLAW_GATEWAY_RECOVERY_POLL_INTERVAL_SECONDS",
+    3,
+  );
+  const attempts =
+    intervalSeconds > 0
+      ? Math.max(1, Math.floor(timeoutSeconds / intervalSeconds) + 1)
+      : Math.max(1, Math.floor(timeoutSeconds) + 1);
+
+  const recovered = waitUntil(() => probe(sandboxName) === true, {
+    initialIntervalMs: intervalSeconds * 1000,
+    maxIntervalMs: intervalSeconds * 1000,
+    backoffFactor: 1,
+    maxAttempts: attempts,
+    sleep: (ms) => sleep(ms / 1000),
+  });
+  if (!recovered) return false;
+
+  // #4710: a freshly relaunched gateway can serve for ~20s and then drop
+  // its HTTP listener while the process stays alive (a failed in-process
+  // restart triggered by a post-launch config write parks it deaf). One
+  // successful probe inside that window is not proof of recovery — wait
+  // out a settle window and require the gateway to still be serving.
+  // 0 disables the settle confirm.
+  // Source boundary and removal condition for this detection live in
+  // gateway-wedge-diagnostics.ts.
+  const settleSeconds = readNonNegativeNumberEnv("NEMOCLAW_GATEWAY_RECOVERY_SETTLE_SECONDS", 25);
+  if (settleSeconds <= 0) {
+    return true;
+  }
+  if (!options.quiet) {
+    console.log(`  Confirming the gateway stays responsive (~${settleSeconds}s)...`);
+  }
+  sleep(settleSeconds);
+  return probe(sandboxName) === true;
+}
+
+/**
+ * Re-establish the dashboard port forward to the sandbox.
+ * Uses the recorded dashboard port for OpenClaw sandboxes, or the agent's
+ * declared forward port when a non-OpenClaw agent is active.
+ * Returns true when `forward start` succeeded and a follow-up probe
+ * confirms the new entry is running, false otherwise.
+ */
+function ensureSandboxPortForward(sandboxName: string): boolean {
+  return ensureSandboxPortForwardForPort(sandboxName, resolveSandboxDashboardPort(sandboxName));
+}
+
+/**
+ * Probe `openshell forward list` for the sandbox's dashboard forward.
+ * Returns true when an entry exists for the expected sandbox+port pair
+ * with STATUS=running, false when the entry is missing or non-running,
+ * "occupied" when another sandbox already owns the expected port, and
+ * null when openshell is unreachable.
+ *
+ * The in-sandbox gateway and the host-side forward are independent
+ * dimensions: the forward can die (host SSH session dropped, list shows
+ * STATUS=dead) while the gateway keeps listening on 127.0.0.1:<port>.
+ *
+ * Also falls back to a local TCP/HTTP probe of 127.0.0.1:<port> when
+ * `forward list` would classify the entry as not-running. openshell's
+ * STATUS column lags real state — it can show "dead" for an entry that
+ * is still serving traffic, or hide an entry whose SSH session was just
+ * recycled (#3334). Trusting the column verbatim made every `connect`
+ * print a "missing or dead" preamble followed by a "Failed to
+ * re-establish" line even though the forward worked.
+ */
+function isSandboxForwardHealthy(sandboxName: string): SandboxForwardHealth {
+  return isSandboxPortForwardHealthy(sandboxName, resolveSandboxDashboardPort(sandboxName));
+}
+
+function isSandboxPortForwardHealthy(sandboxName: string, port: number): SandboxForwardHealth {
+  const result = captureOpenshell(["forward", "list"], {
+    ignoreError: true,
+    timeout: OPENSHELL_PROBE_TIMEOUT_MS,
+  });
+  if (!result || isCommandTimeout(result) || result.status !== 0) return null;
+  const entries = parseForwardList(result.output) as SandboxForwardListEntry[];
+  return classifyForwardHealthWithReachability(entries, sandboxName, String(port), () =>
+    isLocalForwardReachable(port),
+  );
+}
+
+function ensureSandboxPortForwardForPort(sandboxName: string, port: number): boolean {
+  const forwardHealth = isSandboxPortForwardHealthy(sandboxName, port);
+  if (forwardHealth === true) return true;
+  if (forwardHealth === "occupied") return false;
+
+  runOpenshell(["forward", "stop", String(port), sandboxName], {
+    ignoreError: true,
+    stdio: "ignore",
+  });
+  const startResult = runOpenshell(
+    ["forward", "start", "--background", String(port), sandboxName],
+    {
+      ignoreError: true,
+    },
+  );
+  if (startResult.status !== 0) return false;
+  return isSandboxPortForwardHealthy(sandboxName, port) === true;
+}
+
+function ensureHermesDashboardPortForwardIfEnabled(sandboxName: string): boolean | null {
+  return ensureHermesDashboardPortForward(sandboxName, {
+    isPortForwardHealthy: isSandboxPortForwardHealthy,
+    ensurePortForward: ensureSandboxPortForwardForPort,
+  });
+}
+
+/**
+ * Re-establish every declared `forward_ports` entry on the active agent
+ * manifest that is not already owned by another recovery helper. The
+ * primary dashboard port is owned by `ensureSandboxPortForward`; the
+ * optional Hermes web dashboard port (a registry-recorded per-sandbox
+ * override that the manifest cannot statically declare) is owned by
+ * `ensureHermesDashboardPortForwardIfEnabled`. Skipping both here keeps
+ * the helpers orthogonal and avoids issuing duplicate `forward start`
+ * calls when an operator pins the Hermes dashboard to one of the
+ * manifest-declared ports.
+ *
+ * Without this helper, any remaining manifest-declared port (e.g.
+ * Hermes' OpenAI-compatible API on 8642) would be silently dropped after
+ * a gateway restart and never re-established by the recovery flow.
+ *
+ * Returns true when every covered declared port is healthy (probed or
+ * re-established), false when at least one declared port could not be
+ * re-established, and `null` when there is no active agent or no
+ * declared port left to manage after the skip set is applied.
+ */
+function ensureDeclaredAgentForwardPortsHealthy(
+  sandboxName: string,
+  primaryPort: number,
+): boolean | null {
+  const agent = agentRuntime.getSessionAgent(sandboxName);
+  if (!agent) return null;
+  const declared = (agent as { forward_ports?: unknown }).forward_ports;
+  if (!Array.isArray(declared) || declared.length === 0) return null;
+  const hermesDashboard = getHermesDashboardRecoveryConfig(sandboxName);
+  const skipSet = new Set<number>([primaryPort]);
+  if (hermesDashboard && Number.isInteger(hermesDashboard.publicPort)) {
+    skipSet.add(hermesDashboard.publicPort);
+  }
+  let sawCovered = false;
+  let allHealthy = true;
+  for (const candidate of declared) {
+    if (typeof candidate !== "number") continue;
+    if (!Number.isInteger(candidate) || candidate < 1 || candidate > 65535) continue;
+    if (skipSet.has(candidate)) continue;
+    sawCovered = true;
+    const health = isSandboxPortForwardHealthy(sandboxName, candidate);
+    if (health === true) continue;
+    if (health === "occupied") {
+      allHealthy = false;
+      continue;
+    }
+    if (!ensureSandboxPortForwardForPort(sandboxName, candidate)) {
+      allHealthy = false;
+    }
+  }
+  if (!sawCovered) return null;
+  return allHealthy;
+}
+
+function recoverHermesDashboardProcessIfEnabled(sandboxName: string): boolean | null {
+  return recoverHermesDashboardProcess(sandboxName, { executeCommand: executeSandboxCommand });
+}
+
+function isHermesAgent(agent: ReturnType<typeof agentRuntime.getSessionAgent>): boolean {
+  return !!agent && agent.name === "hermes";
+}
+
+type SecretBoundaryRefusalReason = "raw-secret" | "inconclusive";
+
+type HermesSecretBoundaryEnforcement =
+  | { refused: false }
+  | { refused: true; reason: SecretBoundaryRefusalReason; stderr: string };
+
+function printValidatorStderr(stderr: string): void {
+  if (!stderr.trim()) return;
+  for (const line of stderr.split(/\r?\n/)) {
+    if (line.trim()) console.error(`  ${line}`);
+  }
+}
+
+/**
+ * Re-run the Hermes env-file secret-boundary validator against a running
+ * gateway, before the probe path returns control to the caller. The
+ * relaunch path already runs the same validator inline as part of
+ * `buildRecoveryScript`, but the probe path returns early as soon as the
+ * gateway is reported healthy, so a poisoned `.env` injected after cold
+ * start would otherwise never be re-evaluated. The check is invoked via
+ * `openshell sandbox exec` (root) so the validator's kill snippet can
+ * actually signal the gateway-user process when refusing — a sandbox-user
+ * SSH shell cannot (test/e2e-gateway-isolation.sh test 13). Every
+ * refusal diagnostic — validator `[SECURITY]` stderr, the helper's own
+ * context line, and the remediation hint — is written to `console.error`
+ * unconditionally, so the offending key (e.g. `TELEGRAM_BOT_TOKEN (line
+ * N)`) and the reason for refusal always reach the operator, including
+ * on the quiet probe/recover path. Returns `null` only when the persisted
+ * sandbox registry entry is not Hermes (no boundary to enforce). When
+ * the registry says Hermes but the in-memory agent definition failed to
+ * load (`getSessionAgent()` returned `null` from its catch path), the
+ * helper fails safe with an inconclusive refusal rather than silently
+ * skipping the boundary. A running Hermes gateway whose root exec
+ * channel is unreachable is also treated as a fail-safe inconclusive
+ * refusal rather than a healthy path. Non-zero validator status without
+ * a `SECRET_BOUNDARY_REFUSED` marker is reported as inconclusive, not as
+ * a raw-secret refusal, so a shell or validator crash does not
+ * masquerade as a poisoned env file.
+ */
+function enforceHermesSecretBoundaryOnRunningGateway(
+  sandboxName: string,
+  agent: ReturnType<typeof agentRuntime.getSessionAgent>,
+): HermesSecretBoundaryEnforcement | null {
+  const persistedAgent = registry.getSandbox(sandboxName)?.agent;
+  if (persistedAgent !== "hermes") return null;
+  if (!isHermesAgent(agent)) {
+    console.error("");
+    console.error(
+      `  ${R}Hermes agent definition could not be loaded for sandbox '${sandboxName}'.${R}`,
+    );
+    console.error("  Refusing recovery to keep the validator-enforced boundary intact.");
+    return { refused: true, reason: "inconclusive", stderr: "" };
+  }
+  const script = buildHermesEnvFileBoundaryStandaloneCheck();
+  const result = executeSandboxExecCommand(sandboxName, script, 30000);
+  if (!result) {
+    console.error("");
+    console.error(
+      `  ${R}Secret-boundary check could not run against the Hermes gateway in '${sandboxName}'.${R}`,
+    );
+    console.error("  Refusing recovery to keep the validator-enforced boundary intact.");
+    return { refused: true, reason: "inconclusive", stderr: "" };
+  }
+  const stdoutMarker = result.stdout
+    .split(/\r?\n/)
+    .reverse()
+    .find((line) => line.trim().startsWith("SECRET_BOUNDARY_"));
+  if (stdoutMarker === SECRET_BOUNDARY_REFUSED_MARKER) {
+    printValidatorStderr(result.stderr);
+    console.error("");
+    console.error(
+      `  ${R}Secret-boundary check refused recovery of Hermes gateway in '${sandboxName}'.${R}`,
+    );
+    console.error("  /sandbox/.hermes/.env contains raw secret-shaped values. Replace them with");
+    console.error(
+      "  openshell:resolve:env:<name> placeholders and re-run `nemoclaw <sandbox> recover`.",
+    );
+    return { refused: true, reason: "raw-secret", stderr: result.stderr };
+  }
+  if (stdoutMarker === SECRET_BOUNDARY_OK_MARKER) {
+    return { refused: false };
+  }
+  if (stdoutMarker === SECRET_BOUNDARY_VALIDATOR_MISSING_MARKER) {
+    console.error(
+      `  [boundary] Hermes secret-boundary validator missing in sandbox '${sandboxName}'; recover proceeded without re-evaluating /sandbox/.hermes/.env. Re-image the sandbox to enable per-run enforcement.`,
+    );
+    return { refused: false };
+  }
+  printValidatorStderr(result.stderr);
+  console.error("");
+  console.error(
+    `  ${R}Secret-boundary check did not complete cleanly for Hermes gateway in '${sandboxName}'.${R}`,
+  );
+  console.error(
+    "  Refusing recovery; inspect the validator output above before re-running `nemoclaw <sandbox> recover`.",
+  );
+  return { refused: true, reason: "inconclusive", stderr: result.stderr };
+}
+
+/**
+ * Detect and recover from a sandbox that survived a gateway restart but
+ * whose OpenClaw processes are not running. Also re-establishes the
+ * host-side dashboard port-forward when it has gone dead independently
+ * of the gateway. Returns an object describing the outcome:
+ * `{ checked, wasRunning, recovered, forwardRecovered, secretBoundaryRefused?, secretBoundaryReason? }`.
+ */
+export function checkAndRecoverSandboxProcesses(
+  sandboxName: string,
+  { quiet = false }: { quiet?: boolean } = {},
+) {
+  const recoveryAgent = agentRuntime.getSessionAgent(sandboxName);
+  if (recoveryAgent && !agentRuntime.hasGatewayRuntime(recoveryAgent)) {
+    return {
+      checked: true,
+      wasRunning: null,
+      recovered: false,
+      forwardRecovered: false,
+      runtime: "terminal" as const,
+    };
+  }
+  const running = isSandboxGatewayRunning(sandboxName);
+  if (running === null) {
+    return { checked: false, wasRunning: null, recovered: false, forwardRecovered: false };
+  }
+  const recoveryPort = resolveSandboxDashboardPort(sandboxName);
+  if (running) {
+    const enforcement = enforceHermesSecretBoundaryOnRunningGateway(sandboxName, recoveryAgent);
+    if (enforcement?.refused) {
+      return {
+        checked: true,
+        wasRunning: true,
+        recovered: false,
+        forwardRecovered: false,
+        secretBoundaryRefused: true,
+        secretBoundaryReason: enforcement.reason,
+      };
+    }
+  }
+  if (running) {
+    // Gateway is alive but the host-side forward can still be dead or
+    // owned by another sandbox. Probe and re-establish only when
+    // necessary so the live-and-healthy path stays a no-op.
+    const dashboardProcessRecovered = recoverHermesDashboardProcessIfEnabled(sandboxName);
+    const forwardHealthy = isSandboxForwardHealthy(sandboxName);
+    if (forwardHealthy === false) {
+      if (!quiet) {
+        console.log("");
+        console.log(`  Dashboard port forward to '${sandboxName}' is missing or dead.`);
+        console.log("  Re-establishing...");
+      }
+      const forwardRecovered = ensureSandboxPortForward(sandboxName);
+      const dashboardForwardRecovered = ensureHermesDashboardPortForwardIfEnabled(sandboxName);
+      const declaredForwardsRecovered = recoverDeclaredAgentForwardPorts(
+        sandboxName,
+        recoveryPort,
+        {
+          quiet,
+        },
+      );
+      if (!quiet) {
+        if (forwardRecovered) {
+          console.log(`  ${G}✓${R} Dashboard port forward re-established.`);
+        } else {
+          console.error("  Failed to re-establish the dashboard port forward.");
+          console.error(
+            `  Run \`openshell forward start --background <port> ${sandboxName}\` manually.`,
+          );
+        }
+      }
+      return {
+        checked: true,
+        wasRunning: true,
+        recovered: false,
+        forwardRecovered:
+          forwardRecovered ||
+          dashboardForwardRecovered === true ||
+          dashboardProcessRecovered === true ||
+          declaredForwardsRecovered === true,
+      };
+    }
+    if (forwardHealthy === "occupied") {
+      if (!quiet) {
+        console.log("");
+        console.error(`  Dashboard port forward for '${sandboxName}' is owned by another sandbox.`);
+        console.error("  Leaving the existing port forward unchanged.");
+      }
+      return { checked: true, wasRunning: true, recovered: false, forwardRecovered: false };
+    }
+    const dashboardForwardRecovered = ensureHermesDashboardPortForwardIfEnabled(sandboxName);
+    const declaredForwardsRecovered = recoverDeclaredAgentForwardPorts(sandboxName, recoveryPort, {
+      quiet,
+    });
+    return {
+      checked: true,
+      wasRunning: true,
+      recovered: false,
+      forwardRecovered:
+        dashboardForwardRecovered === true ||
+        dashboardProcessRecovered === true ||
+        declaredForwardsRecovered === true,
+    };
+  }
+
+  // Gateway not running — attempt recovery
+  if (!quiet) {
+    console.log("");
+    console.log(
+      `  ${agentRuntime.getAgentDisplayName(recoveryAgent)} gateway is not running inside the sandbox (sandbox likely restarted).`,
+    );
+    console.log("  Recovering...");
+  }
+
+  const recovered = recoverSandboxProcesses(sandboxName);
+  if (recovered) {
+    // Wait for gateway to bind its HTTP port before declaring success. The
+    // recovered process can be alive before the OpenAI-compatible API is ready.
+    if (!waitForRecoveredSandboxGateway(sandboxName, { quiet })) {
+      if (!quiet) {
+        console.error("  Gateway process started but is not responding.");
+        printGatewayWedgeDiagnostics(sandboxName, executeSandboxExecCommand);
+        console.error("  Check /tmp/gateway.log inside the sandbox for details.");
+        console.error("  Connect to the sandbox and run manually:");
+        console.error(
+          `    ${agentRuntime.buildManualRecoveryCommand(recoveryAgent, recoveryPort)}`,
+        );
+      }
+      return { checked: true, wasRunning: false, recovered: false, forwardRecovered: false };
+    }
+    const forwardRecovered = ensureSandboxPortForward(sandboxName);
+    const dashboardForwardRecovered = ensureHermesDashboardPortForwardIfEnabled(sandboxName);
+    const declaredForwardsRecovered = recoverDeclaredAgentForwardPorts(sandboxName, recoveryPort, {
+      quiet,
+    });
+    if (!quiet) {
+      console.log(
+        `  ${G}✓${R} ${agentRuntime.getAgentDisplayName(recoveryAgent)} gateway restarted inside sandbox.`,
+      );
+      if (forwardRecovered) {
+        console.log(`  ${G}✓${R} Dashboard port forward re-established.`);
+      } else {
+        console.error("  Failed to re-establish the dashboard port forward.");
+        console.error(
+          `  Run \`openshell forward start --background <port> ${sandboxName}\` manually.`,
+        );
+      }
+    }
+    return {
+      checked: true,
+      wasRunning: false,
+      recovered,
+      forwardRecovered:
+        forwardRecovered ||
+        dashboardForwardRecovered === true ||
+        declaredForwardsRecovered === true,
+    };
+  }
+  if (!quiet) {
+    console.error(
+      `  Could not restart ${agentRuntime.getAgentDisplayName(recoveryAgent)} gateway automatically.`,
+    );
+    console.error("  Connect to the sandbox and run manually:");
+    console.error(`    ${agentRuntime.buildManualRecoveryCommand(recoveryAgent, recoveryPort)}`);
+  }
+
+  return { checked: true, wasRunning: false, recovered, forwardRecovered: false };
+}
