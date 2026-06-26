@@ -4,6 +4,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // NemoHermes — alias for NemoClaw with the Hermes agent pre-selected.
-process.env.NEMOCLAW_AGENT = "hermes";
-process.env.NEMOCLAW_INVOKED_AS = "nemohermes";
+process.env.NEMOCLAW_AGENT = "worldcup";
+process.env.NEMOCLAW_INVOKED_AS = "nemoworldcup";
 module.exports = require("../dist/nemoclaw");
