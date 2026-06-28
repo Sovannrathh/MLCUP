@@ -1,3 +1,6 @@
+# Claude Code worktrees
+.claude/worktrees/
+
 # Build artifacts and caches
 .version
 *.pyc
