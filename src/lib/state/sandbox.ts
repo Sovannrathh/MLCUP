@@ -28,7 +28,7 @@ import { spawnSync } from "child_process";
 import { captureSandboxSshConfigCommand } from "../adapters/openshell/client.js";
 import { resolveOpenshell } from "../adapters/openshell/resolve.js";
 import { OPENSHELL_PROBE_TIMEOUT_MS } from "../adapters/openshell/timeouts.js";
-import type { AgentStateFile } from "../agent/defs.js";
+import type { AgentDefinition, AgentStateFile } from "../agent/defs.js";
 import { loadAgent } from "../agent/defs.js";
 import { isRecord, type UnknownRecord } from "../core/json-types.js";
 import { shellQuote } from "../runner.js";
@@ -1021,7 +1021,16 @@ function restoreStateFile(
 export function backupSandboxState(sandboxName: string, options: BackupOptions = {}): BackupResult {
   const sb = registry.getSandbox(sandboxName);
   const agentName = sb?.agent || "openclaw";
-  const agent = loadAgent(agentName);
+  let agent: AgentDefinition;
+  try {
+    agent = loadAgent(agentName);
+  } catch {
+    // Agent manifest not installed (e.g. "openclaw" removed from this build).
+    // No known state layout means nothing to preserve — return empty success so
+    // the sandbox recreate can proceed rather than aborting with a missing-manifest error.
+    _log(`backupSandboxState: agent=${agentName} manifest not found — skipping backup`);
+    return { success: true, backedUpDirs: [], failedDirs: [], backedUpFiles: [], failedFiles: [] };
+  }
   const dir = agent.configPaths.dir;
   const stateDirs = agent.stateDirs;
   const stateFiles = normalizeStateFileSpecs(agent.stateFiles);
