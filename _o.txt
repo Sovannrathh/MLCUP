@@ -1,0 +1,7 @@
+﻿python : C:\Program Files\Python313\python.exe: can't open file 'D:\\MLCUP\\_chk.py': [Errno 2] No such file or directory
+At line:1 char:1
++ python "D:\MLCUP\_chk.py" 2>&1 | Out-File "D:\MLCUP\_o.txt" -Encoding ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Program File...le or directory:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
