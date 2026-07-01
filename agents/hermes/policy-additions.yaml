@@ -80,6 +80,24 @@ network_policies:
       - { path: /usr/bin/python3* }
       - { path: /opt/hermes/.venv/bin/python }
 
+  # ── AI-Q Blueprint backend (aiq-research skill) ──────────────
+  # Loopback for a locally-deployed backend, plus the user-trusted
+  # remote tunnel. Restricted to the skill's client binaries.
+  aiq:
+    name: aiq
+    endpoints:
+      - host: 5547-202-93-13-236.ngrok-free.app
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/hermes }
+      - { path: /usr/bin/python3* }
+      - { path: /opt/hermes/.venv/bin/python }
+
   # NOTE: github.com / api.github.com and the git binary used to
   # live in this base policy and were therefore granted to every
   # Hermes sandbox regardless of user opt-in. They have been moved
@@ -112,6 +130,7 @@ network_policies:
       - { path: /usr/local/bin/hermes }
       - { path: /usr/bin/python3* }
       - { path: /opt/hermes/.venv/bin/python }
+      - { path: /usr/local/bin/curl}
 
   # ── PyPI — needed for pip install (skill/plugin deps) ─────────
   pypi:

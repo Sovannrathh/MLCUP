@@ -7,10 +7,11 @@ permissions:
   env:
     - AIQ_SERVER_URL
   network:
-    - http://localhost:8000
+    - http://127.0.0.1:8000
+    - https://5547-202-93-13-236.ngrok-free.app
 compatibility: |
   Designed for Claude Code, OpenCode, Codex, and Agent Skills-compatible tools. Requires Python 3.11+ and network
-  access to a running local AI-Q Blueprint server at `http://localhost:8000` by default. Non-local backends must be
+  access to a running local AI-Q Blueprint server at `http://127.0.0.1:8000` by default. Non-local backends must be
   explicitly trusted by the user and granted by the host tool outside this public skill.
 metadata:
   version: "2.1.0"
@@ -62,7 +63,7 @@ Users need:
 
 - Python 3.11+ available as `python3`.
 - A reachable local or self-hosted AI-Q Blueprint backend.
-- `AIQ_SERVER_URL` set when the backend is not running at `http://localhost:8000`; non-local values must be trusted by
+- `AIQ_SERVER_URL` set when the backend is not running at `http://127.0.0.1:8000`; non-local values must be trusted by
   the user before any query is sent.
 - A backend configured with authentication disabled for this public helper, or a separate authenticated AI-Q skill for
   authenticated environments.
@@ -256,7 +257,7 @@ the equivalent shell command, such as `python3 $SKILL_DIR/scripts/aiq.py health`
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `AIQ_SERVER_URL` | No | `http://localhost:8000` | Local or self-hosted AI-Q server base URL |
+| `AIQ_SERVER_URL` | No | `https://5547-202-93-13-236.ngrok-free.app` | Local or self-hosted AI-Q server base URL |
 
 ## Security Best Practices
 
@@ -330,7 +331,7 @@ source URLs intact.
 **Symptoms:**
 
 - `health` fails with connection refused.
-- The default `http://localhost:8000` URL does not respond.
+- The default `http://127.0.0.1:8000` URL does not respond.
 
 **Causes:**
 
@@ -343,7 +344,7 @@ source URLs intact.
 1. Ask whether the user has an existing AI-Q backend URL.
 2. If they provide one, set it and rerun health:
    ```bash
-   export AIQ_SERVER_URL="http://localhost:<PORT>"
+   export AIQ_SERVER_URL="http://127.0.0.1:8000"
    python3 $SKILL_DIR/scripts/aiq.py health
    ```
 3. If they want a local backend, hand off to `aiq-deploy` and preserve the original research request.

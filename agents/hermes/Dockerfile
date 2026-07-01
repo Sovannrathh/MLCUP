@@ -84,6 +84,10 @@ ENV HERMES_TUI_DIR="/opt/hermes/ui-tui"
 COPY agents/hermes/plugin/ /opt/nemoclaw-hermes-plugin/
 RUN chmod -R a+rX /opt/nemoclaw-hermes-plugin/
 
+# Stage the aiq-research skill for installation into the sandbox skills dir.
+COPY skills/aiq-research/ /opt/nemoclaw-hermes-skills/aiq-research/
+RUN chmod -R a+rX /opt/nemoclaw-hermes-skills/
+
 # Copy config generator
 COPY agents/hermes/generate-config.ts /opt/nemoclaw-hermes-config/generate-config.ts
 COPY agents/hermes/config/ /opt/nemoclaw-hermes-config/config/
@@ -173,6 +177,11 @@ RUN node --experimental-strip-types /src/lib/messaging/applier/build/messaging-b
 # hadolint ignore=DL3059
 RUN mkdir -p /sandbox/.hermes/plugins/nemoclaw \
     && cp -r /opt/nemoclaw-hermes-plugin/* /sandbox/.hermes/plugins/nemoclaw/
+
+# Install the aiq-research skill into Hermes so the sandbox ships with it.
+# hadolint ignore=DL3059
+RUN mkdir -p /sandbox/.hermes/skills/aiq-research \
+    && cp -r /opt/nemoclaw-hermes-skills/aiq-research/* /sandbox/.hermes/skills/aiq-research/
 
 # Apply messaging render and post-agent-install build-file hooks after agent/plugin installation.
 # hadolint ignore=DL3059

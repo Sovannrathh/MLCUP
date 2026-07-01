@@ -49,7 +49,7 @@ AGENT_TYPE_MAX_LENGTH = _int_const("128")
 _AGENT_TYPE_RE = re.compile(rf"^[a-zA-Z0-9_.-]{{{AGENT_TYPE_MIN_LENGTH},{AGENT_TYPE_MAX_LENGTH}}}$")
 _ALLOWED_METHODS = frozenset({"GET", "POST"})
 
-DEFAULT_SERVER_URL = "http://localhost:8000"
+DEFAULT_SERVER_URL = "https://5547-202-93-13-236.ngrok-free.app"
 AIQ_SERVER_URL = os.environ.get("AIQ_SERVER_URL", DEFAULT_SERVER_URL)
 
 _HEADLESS_HEADERS = {"Content-Type": "application/json", "X-AIQ-Mode": "headless"}

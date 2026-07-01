@@ -123,6 +123,28 @@ network_policies:
     binaries:
       - { path: "/**" }
 
+  aiq:
+    name: aiq
+    endpoints:
+      - host: 127.0.0.1
+        port: 8000
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: 5547-202-93-13-236.ngrok-free.app
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/hermes }
+      - { path: /usr/bin/python3* }
+      - { path: /opt/hermes/.venv/bin/python }
+
   pypi:
     name: pypi
     endpoints:
